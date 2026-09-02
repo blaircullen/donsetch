@@ -51,14 +51,47 @@ impl Cdp {
     /// Connect to a browser-level ws endpoint and spawn the
     /// demux reader task.
     pub async fn connect(ws_url: &str) -> Result<Self, FetchError> {
-        // The only unguarded network primitive in the ghost stack :
-        // a browser that accepts TCP but stalls the WS handshake
-        // would hang the tool call forever.
-        let (ws, _) =
-            tokio::time::timeout(std::time::Duration::from_secs(10), connect_async(ws_url))
+        // DevToolsActivePort can land on disk a beat before the WS
+        // upgrade handler is actually accepting connections : retry
+        // both a per-attempt timeout and a connection-level error
+        // (e.g. ConnectionRefused while Chrome is still binding the
+        // listener) inside one hard 10s outer deadline, so this
+        // stays the only unguarded network primitive in the ghost
+        // stack without hanging the tool call forever.
+        let mut last_err: Option<tokio_tungstenite::tungstenite::Error> = None;
+        let (ws, _) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match tokio::time::timeout(
+                    std::time::Duration::from_millis(750),
+                    connect_async(ws_url),
+                )
                 .await
-                .map_err(|_| FetchError::ghost("cdp connect: ws handshake timeout"))?
-                .map_err(|e| FetchError::ghost(format!("cdp connect: {e}")))?;
+                {
+                    Ok(Ok(pair)) => return pair,
+                    Ok(Err(e)) => {
+                        last_err = Some(e);
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                    }
+                    Err(_) => {
+                        // A bare per-attempt timeout after a prior connection
+                        // error means Chrome recovered and is now merely slow
+                        // to accept the upgrade : don't report the stale
+                        // connection error as the final failure mode.
+                        last_err = None;
+                        tokio::time::sleep(std::time::Duration::from_millis(50)).await
+                    }
+                }
+            }
+        })
+        .await
+        .map_err(|_| match last_err.take() {
+            // The outer deadline hit on a real connection error, not a bare
+            // timeout : surface it, don't launder a permanent failure
+            // (bad URL, TLS/cert error, HTTP-level rejection) into the
+            // generic "handshake timeout" string.
+            Some(e) => FetchError::ghost(format!("cdp connect: {e}")),
+            None => FetchError::ghost("cdp connect: ws handshake timeout"),
+        })?;
         let (write, mut read) = ws.split();
         let pending: Arc<Mutex<HashMap<u64, oneshot::Sender<Value>>>> =
             Arc::new(Mutex::new(HashMap::new()));

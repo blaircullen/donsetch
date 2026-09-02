@@ -29,7 +29,6 @@ use std::time::Instant;
 use serde_json::{Value, json};
 #[cfg(linux_like)]
 use std::os::unix::process::CommandExt as _;
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, Command};
 
 use crate::error::FetchError;
@@ -702,7 +701,12 @@ impl Ghost {
         // Own process group (Unix) / Job Object (Windows):
         // freeze/thaw/kill the whole browser tree.
         proc::Proc::prepare_cmd(&mut cmd);
-        cmd.stdout(Stdio::null()).stderr(Stdio::piped());
+        // DevToolsActivePort is Chrome's atomic readiness signal.  Do not
+        // scrape stderr: Chrome can print "DevTools listening" before the
+        // WebSocket upgrade handler is accepting connections.
+        let active_port = dir.join("DevToolsActivePort");
+        let _ = std::fs::remove_file(&active_port);
+        cmd.stdout(Stdio::null()).stderr(Stdio::null());
         // No orphans even if donsetch dies hard. Linux/Android:
         // prctl(PR_SET_PDEATHSIG). macOS has no prctl; Windows
         // uses the Job Object's KILL_ON_JOB_CLOSE.
@@ -716,24 +720,13 @@ impl Ghost {
             .map_err(|e| FetchError::ghost(format!("spawn: {e}")))?;
         let proc = proc::Proc::from_child(&child)?;
 
-        // The ws endpoint arrives on stderr:
-        // "DevTools listening on ws://127.0.0.1:PORT/..."
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| FetchError::ghost("no stderr pipe"))?;
-        let mut lines = BufReader::new(stderr).lines();
-        let ws_url = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-            while let Ok(Some(line)) = lines.next_line().await {
-                if let Some(i) = line.find("ws://") {
-                    return Some(line[i..].trim().to_string());
-                }
+        let ws_url = match wait_for_devtools(&mut child, &active_port).await {
+            Ok(u) => u,
+            Err(e) => {
+                proc.kill_group();
+                return Err(e);
             }
-            None
-        })
-        .await
-        .map_err(|_| FetchError::ghost("devtools ws timeout"))?
-        .ok_or_else(|| FetchError::ghost("no devtools ws line"))?;
+        };
 
         let cdp = cdp::Cdp::connect(&ws_url).await?;
         // Replant the session vault: login/session cookies harvested
@@ -1660,6 +1653,39 @@ impl Drop for Ghost {
         if let Some(temp) = &self.temp_profile {
             let _ = std::fs::remove_dir_all(temp);
         }
+    }
+}
+
+/// Poll for Chrome's atomic `DevToolsActivePort` readiness file and turn
+/// it into a ws:// endpoint. Three exits: the file appears with a valid
+/// port + path (Ok), the child process exits first (Err, "chrome exited
+/// before DevTools was ready"), or 15s pass with neither (Err, "devtools
+/// ready timeout"). Never reads stderr : a piped-but-undrained stderr
+/// blocks Chrome once its output exceeds the pipe buffer.
+async fn wait_for_devtools(
+    child: &mut Child,
+    active_port: &std::path::Path,
+) -> Result<String, FetchError> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        if let Ok(contents) = std::fs::read_to_string(active_port) {
+            let mut lines = contents.lines();
+            if let (Some(port), Some(path)) = (lines.next(), lines.next())
+                && port.parse::<u16>().is_ok()
+                && path.starts_with("/devtools/browser/")
+            {
+                return Ok(format!("ws://127.0.0.1:{port}{path}"));
+            }
+        }
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(FetchError::ghost(format!(
+                "chrome exited before DevTools was ready: {status}"
+            )));
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(FetchError::ghost("devtools ready timeout"));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
 }
 

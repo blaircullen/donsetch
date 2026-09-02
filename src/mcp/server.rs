@@ -1184,7 +1184,22 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
         };
     }
     let result = fetch_single_inner(daemon, args, url).await;
-    if archive == "off" || result.get("isError") != Some(&json!(true)) {
+    if archive == "off" {
+        return result;
+    }
+    if result.get("isError") != Some(&json!(true)) {
+        let final_url = result
+            .pointer("/structuredContent/url")
+            .and_then(Value::as_str)
+            .unwrap_or(url);
+        if suspicious_redirect(url, final_url) {
+            let reason = tool_error(format!(
+                "live URL redirected away from the requested page: {url} -> {final_url}"
+            ));
+            if let Some(archived) = try_resurrect(daemon, url, &reason).await {
+                return archived;
+            }
+        }
         return result;
     }
     // Resurreactable failures only: dead pages and hard walls.
@@ -1205,6 +1220,43 @@ async fn fetch_single(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Value {
         Some(v) => v,
         None => result,
     }
+}
+
+/// A successful response can still be a dead link: expired properties often
+/// redirect to a new owner's homepage. AUTO checks Wayback for cross-site
+/// redirects and for deep links collapsed to a homepage.
+///
+/// Known limitation: the registrable-domain heuristic below is a
+/// hand-written 2-letter-TLD list, not a real Public Suffix List. It will
+/// treat different tenants under a multi-tenant suffix (e.g. github.io) as
+/// the same site, and will always flag a same-site deep-link-to-home
+/// redirect as suspicious even when it's a legitimate app redirect. Ported
+/// as-is from the pre-v3.5.0 local patch; no PSL dependency added here.
+fn suspicious_redirect(requested: &str, final_url: &str) -> bool {
+    let (Ok(from), Ok(to)) = (url::Url::parse(requested), url::Url::parse(final_url)) else {
+        return false;
+    };
+    if from == to {
+        return false;
+    }
+    let site = |host: &str| {
+        let labels: Vec<&str> = host.trim_start_matches("www.").split('.').collect();
+        let take = if labels.len() >= 3
+            && labels.last().is_some_and(|tld| tld.len() == 2)
+            && matches!(
+                labels[labels.len() - 2],
+                "ac" | "co" | "com" | "edu" | "gov" | "net" | "org"
+            ) {
+            3
+        } else {
+            2
+        };
+        labels[labels.len().saturating_sub(take)..].join(".")
+    };
+    let same_site = site(from.host_str().unwrap_or("")) == site(to.host_str().unwrap_or(""));
+    let deep_to_home =
+        !from.path().trim_matches('/').is_empty() && to.path().trim_matches('/').is_empty();
+    !same_site || deep_to_home
 }
 
 /// v3 F3: find the rel=next pagination link (rel may carry other
@@ -1228,6 +1280,67 @@ fn find_rel_next(html: &str, base: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn pagination_url_continues(current: &str, next: &str) -> bool {
+    let (Ok(current), Ok(next)) = (url::Url::parse(current), url::Url::parse(next)) else {
+        return false;
+    };
+    if current.path() == next.path() {
+        let page = |u: &url::Url| {
+            u.query_pairs()
+                .find(|(k, _)| matches!(k.as_ref(), "page" | "p" | "pg"))
+                .and_then(|(_, v)| v.parse::<u64>().ok())
+        };
+        return matches!((page(&current), page(&next)), (Some(a), Some(b)) if b == a + 1);
+    }
+    fn segment(u: &url::Url) -> &str {
+        u.path_segments()
+            .and_then(|parts| parts.rev().find(|p| !p.is_empty()))
+            .unwrap_or("")
+    }
+    numbered_part(segment(&current), segment(&next))
+}
+
+fn numbered_part(current: &str, next: &str) -> bool {
+    for marker in ["page-", "page_", "part-", "part_"] {
+        if let (Some(a), Some(b)) = (current.rsplit_once(marker), next.rsplit_once(marker))
+            && a.0 == b.0
+        {
+            let number = |s: &str| {
+                s.chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse::<u64>()
+                    .ok()
+            };
+            return matches!((number(a.1), number(b.1)), (Some(x), Some(y)) if y == x + 1);
+        }
+    }
+    matches!((current.parse::<u64>(), next.parse::<u64>()), (Ok(a), Ok(b)) if b == a + 1)
+}
+
+fn title_continues(current: Option<&str>, next: Option<&str>) -> bool {
+    fn canonical(title: &str) -> String {
+        let mut words: Vec<String> = title
+            .split_whitespace()
+            .map(|w| {
+                w.trim_matches(|c: char| !c.is_alphanumeric())
+                    .to_lowercase()
+            })
+            .filter(|w| !w.is_empty())
+            .collect();
+        if words.len() >= 2
+            && words[words.len() - 1]
+                .chars()
+                .all(|c| c.is_ascii_digit() || "ivxlcdm".contains(c))
+            && matches!(words[words.len() - 2].as_str(), "page" | "part")
+        {
+            words.truncate(words.len() - 2);
+        }
+        words.join(" ")
+    }
+    matches!((current, next), (Some(a), Some(b)) if !canonical(a).is_empty() && canonical(a) == canonical(b))
 }
 
 /// Strip a part's frontmatter (title line, URL line, description
@@ -1864,6 +1977,7 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
                 .and_then(|u| u.host_str().map(String::from));
             let mut total = ex.markdown.len();
             let mut parts: Vec<String> = Vec::new();
+            let mut current_url = base_url.clone();
             while parts.len() + 1 < STITCH_MAX_PARTS && total < STITCH_BUDGET {
                 // Hijack guard: never follow rel=next off-host.
                 let Ok(nu) = url::Url::parse(&next) else {
@@ -1888,9 +2002,26 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
                 popts.max_chars = Some(8_000);
                 match extract::extract(&fetched.body, &ct2, &fetched.url, &popts) {
                     Ok(pe) => {
+                        // Post-fetch host check: `next` was validated against
+                        // base_host above, but the fetch itself can still land
+                        // on an off-host redirect. Title continuity alone must
+                        // never override a host mismatch on the URL we actually
+                        // landed on.
+                        let same_host =
+                            match (url::Url::parse(&current_url), url::Url::parse(&fetched.url)) {
+                                (Ok(cur), Ok(landed)) => cur.host_str() == landed.host_str(),
+                                _ => false,
+                            };
+                        if !same_host
+                            || (!pagination_url_continues(&current_url, &fetched.url)
+                                && !title_continues(ex.title.as_deref(), pe.title.as_deref()))
+                        {
+                            break;
+                        }
                         let md = strip_part_frontmatter(&pe.markdown);
                         total += md.len();
                         parts.push(md);
+                        current_url = fetched.url.clone();
                         next = match find_rel_next(&html2, &fetched.url) {
                             Some(n) => n,
                             None => break,
@@ -1975,9 +2106,7 @@ async fn fetch_single_inner(daemon: &Arc<Daemon>, args: &Value, url: &str) -> Va
     if prewarmed && let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["prewarmed_by_search"] = json!(true);
     }
-    if stitched_parts > 1
-        && let Some(sc) = res.pointer_mut("/structuredContent")
-    {
+    if stitch && let Some(sc) = res.pointer_mut("/structuredContent") {
         sc["stitched"] = json!(stitched_parts);
     }
     apply_link_handles(daemon, &mut res).await;
@@ -3844,6 +3973,63 @@ mod stitch_tests {
             "# My Story\nhttps://example.com/p2\n> Same description\n\nPart two content here.";
         assert_eq!(strip_part_frontmatter(part), "Part two content here.");
         assert_eq!(strip_part_frontmatter("Just content"), "Just content");
+    }
+
+    #[test]
+    fn pagination_continuity_rejects_adjacent_articles_and_doc_versions() {
+        assert!(!pagination_url_continues(
+            "https://blog.test/2000/04/06/first-post/",
+            "https://blog.test/2000/04/07/second-post/"
+        ));
+        assert!(!pagination_url_continues(
+            "https://docs.python.org/3/whatsnew/3.13.html",
+            "https://docs.python.org/3/whatsnew/3.12.html"
+        ));
+        assert!(!title_continues(
+            Some("What's New In Python 3.13"),
+            Some("What's New In Python 3.12")
+        ));
+    }
+
+    #[test]
+    fn pagination_continuity_accepts_real_page_sequences() {
+        assert!(pagination_url_continues(
+            "https://example.test/story?page=2",
+            "https://example.test/story?page=3"
+        ));
+        assert!(pagination_url_continues(
+            "https://example.test/story/page-2.html",
+            "https://example.test/story/page-3.html"
+        ));
+        assert!(title_continues(
+            Some("A Long Story — Part II"),
+            Some("A Long Story — Part III")
+        ));
+    }
+}
+
+#[cfg(test)]
+mod archive_redirect_tests {
+    use super::suspicious_redirect;
+
+    #[test]
+    fn cross_site_and_deep_to_home_are_suspicious() {
+        assert!(suspicious_redirect(
+            "http://www.geocities.com/EnchantedForest/1234",
+            "https://www.yahoo.com/"
+        ));
+        assert!(suspicious_redirect(
+            "https://example.com/articles/missing",
+            "https://www.example.com/"
+        ));
+        assert!(!suspicious_redirect(
+            "http://example.com/article",
+            "https://www.example.com/article"
+        ));
+        assert!(!suspicious_redirect(
+            "https://docs.example.co.uk/article",
+            "https://www.example.co.uk/article"
+        ));
     }
 }
 
